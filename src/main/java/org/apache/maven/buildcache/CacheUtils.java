@@ -26,19 +26,25 @@ import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.PathMatcher;
+import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.function.Supplier;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-import java.util.zip.ZipOutputStream;
 
+import org.apache.commons.compress.archivers.zip.UnixStat;
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
+import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream;
+import org.apache.commons.compress.archivers.zip.ZipFile;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.mutable.MutableBoolean;
 import org.apache.maven.artifact.Artifact;
@@ -60,7 +66,6 @@ import static org.apache.maven.artifact.Artifact.SNAPSHOT_VERSION;
  * Cache Utils
  */
 public class CacheUtils {
-
     public static boolean isPom(MavenProject project) {
         return project.getPackaging().equals("pom");
     }
@@ -174,23 +179,37 @@ public class CacheUtils {
      */
     public static boolean zip(final Path dir, final Path zip, final String glob) throws IOException {
         final MutableBoolean hasFiles = new MutableBoolean();
-        try (ZipOutputStream zipOutputStream = new ZipOutputStream(Files.newOutputStream(zip))) {
 
+        try (ZipArchiveOutputStream zipOutputStream = new ZipArchiveOutputStream(zip)) {
             PathMatcher matcher =
                     "*".equals(glob) ? null : FileSystems.getDefault().getPathMatcher("glob:" + glob);
             Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
-
                 @Override
                 public FileVisitResult visitFile(Path path, BasicFileAttributes basicFileAttributes)
                         throws IOException {
-
                     if (matcher == null || matcher.matches(path.getFileName())) {
-                        final ZipEntry zipEntry =
-                                new ZipEntry(dir.relativize(path).toString());
-                        zipOutputStream.putNextEntry(zipEntry);
-                        Files.copy(path, zipOutputStream);
+                        final ZipArchiveEntry zipEntry = new ZipArchiveEntry(
+                                path.toFile(), dir.relativize(path).toString());
+
+                        if (basicFileAttributes.isSymbolicLink()) {
+                            zipEntry.setUnixMode(UnixStat.LINK_FLAG | UnixStat.DEFAULT_LINK_PERM);
+                        } else {
+                            if (isPosixSupported()) {
+                                Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(path);
+                                zipEntry.setUnixMode(toUnixMode(permissions));
+                            }
+                        }
+                        zipOutputStream.putArchiveEntry(zipEntry);
+
+                        if (!Files.isSymbolicLink(path)) {
+                            Files.copy(path, zipOutputStream);
+                        } else {
+                            // write the target of the symlink
+                            zipOutputStream.write(
+                                    Files.readSymbolicLink(path).toString().getBytes());
+                        }
                         hasFiles.setTrue();
-                        zipOutputStream.closeEntry();
+                        zipOutputStream.closeArchiveEntry();
                     }
                     return FileVisitResult.CONTINUE;
                 }
@@ -200,24 +219,110 @@ public class CacheUtils {
     }
 
     public static void unzip(Path zip, Path out) throws IOException {
-        try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(zip))) {
-            ZipEntry entry = zis.getNextEntry();
-            while (entry != null) {
-                Path file = out.resolve(entry.getName());
-                if (!file.normalize().startsWith(out.normalize())) {
-                    throw new RuntimeException("Bad zip entry");
-                }
-                if (entry.isDirectory()) {
-                    Files.createDirectory(file);
+        ZipFile zipFile = ZipFile.builder().setPath(zip).get();
+        Enumeration<ZipArchiveEntry> entries = zipFile.getEntries();
+        while (entries.hasMoreElements()) {
+            ZipArchiveEntry entry = entries.nextElement();
+            Path file = out.resolve(entry.getName());
+            if (!file.normalize().startsWith(out.normalize())) {
+                throw new RuntimeException("Bad zip entry");
+            }
+            if (entry.isDirectory()) {
+                Files.createDirectory(file);
+            } else {
+                Path parent = file.getParent();
+                Files.createDirectories(parent);
+                if (isPosixSupported() && entry.isUnixSymlink()) {
+                    Path target = Paths.get(zipFile.getUnixSymlink(entry));
+                    Files.deleteIfExists(file);
+                    Files.createSymbolicLink(file, target);
                 } else {
-                    Path parent = file.getParent();
-                    Files.createDirectories(parent);
-                    Files.copy(zis, file, StandardCopyOption.REPLACE_EXISTING);
+                    Files.copy(zipFile.getInputStream(entry), file, StandardCopyOption.REPLACE_EXISTING);
                 }
+            }
+            if (!entry.isUnixSymlink()) {
                 Files.setLastModifiedTime(file, FileTime.fromMillis(entry.getTime()));
-                entry = zis.getNextEntry();
+                if (isPosixSupported()) {
+                    Files.setPosixFilePermissions(file, fromUnixMode(entry.getUnixMode()));
+                }
             }
         }
+    }
+
+    public static boolean isPosixSupported() {
+        return FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
+    }
+
+    protected static int toUnixMode(final Set<PosixFilePermission> permissions) {
+        int mode = 0;
+        for (PosixFilePermission permission : permissions) {
+            switch (permission) {
+                case OWNER_READ:
+                    mode |= 0400;
+                    break;
+                case OWNER_WRITE:
+                    mode |= 0200;
+                    break;
+                case OWNER_EXECUTE:
+                    mode |= 0100;
+                    break;
+                case GROUP_READ:
+                    mode |= 0040;
+                    break;
+                case GROUP_WRITE:
+                    mode |= 0020;
+                    break;
+                case GROUP_EXECUTE:
+                    mode |= 0010;
+                    break;
+                case OTHERS_READ:
+                    mode |= 0004;
+                    break;
+                case OTHERS_WRITE:
+                    mode |= 0002;
+                    break;
+                case OTHERS_EXECUTE:
+                    mode |= 0001;
+                    break;
+                default:
+                    break;
+            }
+        }
+        return mode;
+    }
+
+    public static Set<PosixFilePermission> fromUnixMode(int mode) {
+        Set<PosixFilePermission> permissions = new HashSet<>();
+
+        if ((mode & 0400) != 0) {
+            permissions.add(PosixFilePermission.OWNER_READ);
+        }
+        if ((mode & 0200) != 0) {
+            permissions.add(PosixFilePermission.OWNER_WRITE);
+        }
+        if ((mode & 0100) != 0) {
+            permissions.add(PosixFilePermission.OWNER_EXECUTE);
+        }
+        if ((mode & 0040) != 0) {
+            permissions.add(PosixFilePermission.GROUP_READ);
+        }
+        if ((mode & 0020) != 0) {
+            permissions.add(PosixFilePermission.GROUP_WRITE);
+        }
+        if ((mode & 0010) != 0) {
+            permissions.add(PosixFilePermission.GROUP_EXECUTE);
+        }
+        if ((mode & 0004) != 0) {
+            permissions.add(PosixFilePermission.OTHERS_READ);
+        }
+        if ((mode & 0002) != 0) {
+            permissions.add(PosixFilePermission.OTHERS_WRITE);
+        }
+        if ((mode & 0001) != 0) {
+            permissions.add(PosixFilePermission.OTHERS_EXECUTE);
+        }
+
+        return permissions;
     }
 
     public static <T> void debugPrintCollection(
