@@ -20,6 +20,7 @@ package org.apache.maven.buildcache;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -34,13 +35,19 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.stream.Stream;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
 
+import org.apache.commons.compress.archivers.zip.ParallelScatterZipCreator;
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
 import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
 import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream;
+import org.apache.commons.compress.parallel.InputStreamSupplier;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Strings;
 import org.apache.commons.lang3.mutable.MutableBoolean;
@@ -153,6 +160,42 @@ public class CacheUtils {
     }
 
     /**
+     * File extensions that are already compressed and should be stored without compression.
+     */
+    private static final Set<String> INCOMPRESSIBLE_EXTENSIONS = new HashSet<>(Arrays.asList(
+            // Archives
+            ".zip",
+            ".gz",
+            ".tgz",
+            ".bz2",
+            ".xz",
+            ".7z",
+            ".rar",
+            ".jar",
+            ".war",
+            ".ear",
+            // Images
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".webp",
+            ".ico",
+            ".svg",
+            // Media
+            ".mp3",
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".webm",
+            ".ogg",
+            // Other
+            ".woff",
+            ".woff2",
+            ".eot",
+            ".ttf"));
+
+    /**
      * Put every matching files of a directory in a zip.
      * @param dir directory to zip
      * @param zip zip to populate
@@ -173,36 +216,88 @@ public class CacheUtils {
         final boolean supportsPosix = preservePermissions
                 && dir.getFileSystem().supportedFileAttributeViews().contains("posix");
 
-        try (ZipArchiveOutputStream zipOutputStream = new ZipArchiveOutputStream(Files.newOutputStream(zip))) {
+        try (ZipArchiveOutputStream zipOutputStream = new ZipArchiveOutputStream(zip)) {
+            zipOutputStream.setLevel(Deflater.BEST_SPEED);
+            ParallelScatterZipCreator parallelCreator =
+                    new ParallelScatterZipCreator(java.util.concurrent.Executors.newWorkStealingPool());
 
             PathMatcher matcher =
                     "*".equals(glob) ? null : FileSystems.getDefault().getPathMatcher("glob:" + glob);
-            Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
 
+            Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
                 @Override
                 public FileVisitResult visitFile(Path path, BasicFileAttributes basicFileAttributes)
                         throws IOException {
-
                     if (matcher == null || matcher.matches(path.getFileName())) {
-                        final ZipArchiveEntry zipEntry =
-                                new ZipArchiveEntry(dir.relativize(path).toString());
-
-                        // Preserve Unix permissions if requested and filesystem supports it
-                        if (supportsPosix) {
-                            Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(path);
-                            zipEntry.setUnixMode(permissionsToMode(permissions));
-                        }
-
-                        zipOutputStream.putArchiveEntry(zipEntry);
-                        Files.copy(path, zipOutputStream);
+                        String relativePath = dir.relativize(path).toString();
+                        final ZipArchiveEntry zipEntry = createZipEntry(path, relativePath, supportsPosix);
+                        InputStreamSupplier streamSupplier = () -> {
+                            try {
+                                return Files.newInputStream(path);
+                            } catch (IOException e) {
+                                throw new java.io.UncheckedIOException(e);
+                            }
+                        };
+                        parallelCreator.addArchiveEntry(zipEntry, streamSupplier);
                         hasFiles.setTrue();
-                        zipOutputStream.closeArchiveEntry();
                     }
                     return FileVisitResult.CONTINUE;
                 }
             });
+
+            try {
+                parallelCreator.writeTo(zipOutputStream);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Zip creation interrupted", e);
+            } catch (ExecutionException e) {
+                throw new IOException("Zip creation failed", e.getCause());
+            }
         }
         return hasFiles.booleanValue();
+    }
+
+    private static ZipArchiveEntry createZipEntry(Path path, String relativePath, boolean supportsPosix)
+            throws IOException {
+        ZipArchiveEntry zipEntry = new ZipArchiveEntry(path.toFile(), relativePath);
+
+        if (isIncompressible(path)) {
+            zipEntry.setMethod(ZipEntry.STORED);
+            zipEntry.setSize(Files.size(path));
+            zipEntry.setCrc(computeCrc32(path));
+        } else {
+            // ParallelScatterZipCreator requires method to be explicitly set
+            zipEntry.setMethod(ZipEntry.DEFLATED);
+        }
+
+        if (supportsPosix) {
+            Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(path);
+            zipEntry.setUnixMode(permissionsToMode(permissions));
+        }
+
+        return zipEntry;
+    }
+
+    private static boolean isIncompressible(Path path) {
+        String fileName = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        for (String ext : INCOMPRESSIBLE_EXTENSIONS) {
+            if (fileName.endsWith(ext)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static long computeCrc32(Path path) throws IOException {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        byte[] buffer = new byte[8192];
+        try (InputStream in = Files.newInputStream(path)) {
+            int len;
+            while ((len = in.read(buffer)) != -1) {
+                crc.update(buffer, 0, len);
+            }
+        }
+        return crc.getValue();
     }
 
     public static void unzip(Path zip, Path out, boolean preservePermissions) throws IOException {

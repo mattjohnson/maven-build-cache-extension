@@ -31,6 +31,7 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -155,11 +156,45 @@ class CacheUtilsPermissionsTest {
     }
 
     /**
+     * Tests basic zip/unzip roundtrip with multiple files and nested directories.
+     */
+    @Test
+    void testZipUnzipRoundtrip() throws IOException {
+        // Given: A directory structure with multiple files
+        Path sourceDir = tempDir.resolve("source");
+        Files.createDirectories(sourceDir.resolve("subdir"));
+        writeString(sourceDir.resolve("file1.txt"), "content 1");
+        writeString(sourceDir.resolve("file2.txt"), "content 2");
+        writeString(sourceDir.resolve("subdir/nested.txt"), "nested content");
+
+        // When: Zip and unzip
+        Path zipFile = tempDir.resolve("test.zip");
+        boolean hasFiles = CacheUtils.zip(sourceDir, zipFile, "*", false);
+
+        Path extractDir = tempDir.resolve("extracted");
+        Files.createDirectories(extractDir);
+        CacheUtils.unzip(zipFile, extractDir, false);
+
+        // Then: All files should be restored with correct content
+        assertTrue(hasFiles, "Zip should report having files");
+        assertEquals("content 1", readString(extractDir.resolve("file1.txt")));
+        assertEquals("content 2", readString(extractDir.resolve("file2.txt")));
+        assertEquals("nested content", readString(extractDir.resolve("subdir/nested.txt")));
+    }
+
+    /**
      * Java 8 compatible version of Files.writeString().
      */
     private void writeString(Path path, String content) throws IOException {
         try (OutputStream out = Files.newOutputStream(path)) {
             out.write(content.getBytes(StandardCharsets.UTF_8));
         }
+    }
+
+    /**
+     * Java 8 compatible version of Files.readString().
+     */
+    private String readString(Path path) throws IOException {
+        return new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
     }
 }
