@@ -23,6 +23,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Arrays;
@@ -31,8 +32,11 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Tests for permission preservation in CacheUtils.zip() and CacheUtils.unzip() methods.
@@ -155,11 +159,222 @@ class CacheUtilsPermissionsTest {
     }
 
     /**
+     * Tests that symlinks are correctly preserved through zip/unzip cycle when preserveSymlinks=true.
+     */
+    @Test
+    void testSymlinkPreservation() throws IOException {
+        // Skip test on non-POSIX filesystems (e.g., Windows)
+        if (!tempDir.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            return;
+        }
+
+        // Given: A directory with a file and a symlink pointing to it
+        Path sourceDir = tempDir.resolve("source");
+        Files.createDirectories(sourceDir);
+        Path targetFile = sourceDir.resolve("target.txt");
+        writeString(targetFile, "target content");
+        Path symlink = sourceDir.resolve("link.txt");
+        Files.createSymbolicLink(symlink, targetFile.getFileName());
+
+        // When: Zip and unzip the directory with preserveSymlinks=true
+        Path zipFile = tempDir.resolve("test.zip");
+        CacheUtils.zip(sourceDir, zipFile, "*", true, true);
+
+        Path extractDir = tempDir.resolve("extracted");
+        Files.createDirectories(extractDir);
+        CacheUtils.unzip(zipFile, extractDir, true, true);
+
+        // Then: The symlink should be preserved
+        Path extractedSymlink = extractDir.resolve("link.txt");
+        assertTrue(Files.isSymbolicLink(extractedSymlink), "Symlink should be preserved after zip/unzip");
+        assertEquals(targetFile.getFileName(), Files.readSymbolicLink(extractedSymlink));
+        assertEquals("target content", readString(extractDir.resolve("target.txt")));
+    }
+
+    /**
+     * Tests the exact behavior when preserveSymlinks=false and source contains a symlink.
+     * Verifies that symlinks are followed and their target content is stored as regular files.
+     */
+    @Test
+    void testSymlinkNotPreservedByDefault() throws IOException {
+        // Skip test on non-POSIX filesystems (e.g., Windows)
+        if (!tempDir.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            return;
+        }
+
+        // Given: A directory with a file and a symlink pointing to it
+        Path sourceDir = tempDir.resolve("source");
+        Files.createDirectories(sourceDir);
+        Path targetFile = sourceDir.resolve("target.txt");
+        writeString(targetFile, "target content");
+        Path symlink = sourceDir.resolve("link.txt");
+        Files.createSymbolicLink(symlink, targetFile.getFileName());
+
+        // Verify symlink exists in source
+        assertTrue(Files.isSymbolicLink(symlink), "Symlink should exist in source");
+
+        // When: Zip with preserveSymlinks=false
+        Path zipFile = tempDir.resolve("test.zip");
+        CacheUtils.zip(sourceDir, zipFile, "*", true, false);
+
+        // Inspect zip contents to understand what was stored
+        try (org.apache.commons.compress.archivers.zip.ZipFile zf =
+                org.apache.commons.compress.archivers.zip.ZipFile.builder()
+                        .setPath(zipFile)
+                        .get()) {
+
+            org.apache.commons.compress.archivers.zip.ZipArchiveEntry linkEntry = zf.getEntry("link.txt");
+            assertNotNull(linkEntry, "link.txt should exist in zip");
+            assertFalse(linkEntry.isUnixSymlink(), "Entry should NOT be stored as symlink when preserveSymlinks=false");
+
+            // Read the content stored in the zip for the symlink entry (Java 8 compatible)
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            try (java.io.InputStream is = zf.getInputStream(linkEntry)) {
+                byte[] buffer = new byte[1024];
+                int len;
+                while ((len = is.read(buffer)) != -1) {
+                    baos.write(buffer, 0, len);
+                }
+            }
+            String storedContent = new String(baos.toByteArray(), StandardCharsets.UTF_8);
+            assertEquals(
+                    "target content",
+                    storedContent,
+                    "When preserveSymlinks=false, symlink should be followed and target content stored");
+        }
+
+        // When: Unzip
+        Path extractDir = tempDir.resolve("extracted");
+        Files.createDirectories(extractDir);
+        CacheUtils.unzip(zipFile, extractDir, true, false);
+
+        // Then: The symlink should be extracted as a regular file with target content
+        Path extractedFile = extractDir.resolve("link.txt");
+        assertTrue(Files.exists(extractedFile), "link.txt should be extracted");
+        assertFalse(Files.isSymbolicLink(extractedFile), "Extracted file should NOT be a symlink");
+        assertEquals("target content", readString(extractedFile), "Content should match original target");
+    }
+
+    /**
+     * Tests that symlinks within the module boundary are allowed.
+     * Simulates: module/target/node_modules/link -> module/src/something (within module)
+     */
+    @Test
+    void testSymlinkWithinModuleBoundaryAllowed() throws IOException {
+        // Skip test on non-POSIX filesystems (e.g., Windows)
+        if (!tempDir.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            return;
+        }
+
+        // Given: A module structure with symlink pointing to sibling directory
+        // module/
+        //   src/shared.txt
+        //   target/node_modules/link.txt -> ../../src/shared.txt
+        Path moduleRoot = tempDir.resolve("module");
+        Path srcDir = moduleRoot.resolve("src");
+        Path targetDir = moduleRoot.resolve("target");
+        Path nodeModules = targetDir.resolve("node_modules");
+        Files.createDirectories(srcDir);
+        Files.createDirectories(nodeModules);
+
+        Path sharedFile = srcDir.resolve("shared.txt");
+        writeString(sharedFile, "shared content");
+
+        // Symlink using relative path: ../../src/shared.txt (stays within module)
+        Path symlink = nodeModules.resolve("link.txt");
+        Files.createSymbolicLink(symlink, Paths.get("../../src/shared.txt"));
+
+        // When: Zip with module root as boundary (should succeed)
+        Path zipFile = tempDir.resolve("test.zip");
+        boolean hasFiles = CacheUtils.zip(nodeModules, zipFile, "*", true, true, moduleRoot);
+
+        // Then: Zip should succeed because symlink stays within module boundary
+        assertTrue(hasFiles, "Zip should succeed for symlinks within module boundary");
+    }
+
+    /**
+     * Tests that symlinks escaping the module boundary are rejected.
+     * Simulates: module/target/node_modules/link -> /etc/passwd (escaping module)
+     */
+    @Test
+    void testSymlinkEscapingModuleBoundaryRejected() throws IOException {
+        // Skip test on non-POSIX filesystems (e.g., Windows)
+        if (!tempDir.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            return;
+        }
+
+        // Given: A module structure with symlink escaping to outside
+        Path moduleRoot = tempDir.resolve("module");
+        Path targetDir = moduleRoot.resolve("target");
+        Path nodeModules = targetDir.resolve("node_modules");
+        Files.createDirectories(nodeModules);
+
+        // File outside the module
+        Path outsideFile = tempDir.resolve("outside.txt");
+        writeString(outsideFile, "outside content");
+
+        // Symlink using absolute path escaping module
+        Path escapingSymlink = nodeModules.resolve("escape.txt");
+        Files.createSymbolicLink(escapingSymlink, outsideFile.toAbsolutePath());
+
+        // When/Then: Zip should fail because symlink escapes module boundary
+        Path zipFile = tempDir.resolve("test.zip");
+        try {
+            CacheUtils.zip(nodeModules, zipFile, "*", true, true, moduleRoot);
+            fail("Expected IOException for symlink escaping module boundary");
+        } catch (IOException e) {
+            assertTrue(e.getMessage().contains("escapes boundary"), "Error should mention boundary escape");
+        }
+    }
+
+    /**
+     * Tests that relative symlinks using too many ".." to escape module are rejected.
+     * Simulates: module/target/node_modules/link -> ../../../outside.txt (escaping module)
+     */
+    @Test
+    void testRelativeSymlinkEscapingModuleBoundaryRejected() throws IOException {
+        // Skip test on non-POSIX filesystems (e.g., Windows)
+        if (!tempDir.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            return;
+        }
+
+        // Given: A module structure with relative symlink escaping
+        Path moduleRoot = tempDir.resolve("module");
+        Path targetDir = moduleRoot.resolve("target");
+        Path nodeModules = targetDir.resolve("node_modules");
+        Files.createDirectories(nodeModules);
+
+        // File outside the module
+        Path outsideFile = tempDir.resolve("outside.txt");
+        writeString(outsideFile, "outside content");
+
+        // Symlink: ../../../outside.txt (goes up 3 levels from node_modules, escaping module)
+        Path escapingSymlink = nodeModules.resolve("escape.txt");
+        Files.createSymbolicLink(escapingSymlink, Paths.get("../../../outside.txt"));
+
+        // When/Then: Zip should fail because symlink escapes module boundary
+        Path zipFile = tempDir.resolve("test.zip");
+        try {
+            CacheUtils.zip(nodeModules, zipFile, "*", true, true, moduleRoot);
+            fail("Expected IOException for relative symlink escaping module boundary");
+        } catch (IOException e) {
+            assertTrue(e.getMessage().contains("escapes boundary"), "Error should mention boundary escape");
+        }
+    }
+
+    /**
      * Java 8 compatible version of Files.writeString().
      */
     private void writeString(Path path, String content) throws IOException {
         try (OutputStream out = Files.newOutputStream(path)) {
             out.write(content.getBytes(StandardCharsets.UTF_8));
         }
+    }
+
+    /**
+     * Java 8 compatible version of Files.readString().
+     */
+    private String readString(Path path) throws IOException {
+        return new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
     }
 }

@@ -417,6 +417,12 @@ under the License.
                     <defaultValue>*</defaultValue>
                     <description>Entries are filtered by matching this glob.</description>
                 </field>
+                <field xml.attribute="true">
+                    <name>preserveSymlinks</name>
+                    <type>boolean</type>
+                    <defaultValue>false</defaultValue>
+                    <description>Preserve symbolic links when caching this directory. When enabled, symlinks are stored as symlinks rather than copying their target content. Disabled by default for security and portability. When enabled, symlink targets are validated to ensure they don't point outside the project directory.</description>
+                </field>
             </fields>
         </class>
 

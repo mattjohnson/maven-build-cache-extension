@@ -249,6 +249,11 @@ under the License.
           <type>boolean</type>
           <description>Indicates if this artifact represents a directory (e.g., target/classes) that was zipped for caching</description>
         </field>
+        <field>
+          <name>preserveSymlinks</name>
+          <type>boolean</type>
+          <description>Indicates if symbolic links should be preserved when restoring this artifact. Only applicable to zipped directory artifacts.</description>
+        </field>
       <!--/xs:sequence-->
       </fields>
     <!--/xs:complexType-->

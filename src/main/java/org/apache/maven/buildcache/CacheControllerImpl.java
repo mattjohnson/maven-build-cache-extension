@@ -136,11 +136,24 @@ public class CacheControllerImpl implements CacheController {
     private volatile Scm scm;
 
     /**
+     * Holds information about an attached resource (zipped directory).
+     */
+    private static class AttachedResourceInfo {
+        final Path relativePath;
+        final boolean preserveSymlinks;
+
+        AttachedResourceInfo(Path relativePath, boolean preserveSymlinks) {
+            this.relativePath = relativePath;
+            this.preserveSymlinks = preserveSymlinks;
+        }
+    }
+
+    /**
      * Per-project cache state to ensure thread safety in multi-threaded builds.
      * Each project gets isolated state for resource tracking, counters, and restored output tracking.
      */
     private static class ProjectCacheState {
-        final Map<String, Path> attachedResourcesPathsById = new HashMap<>();
+        final Map<String, AttachedResourceInfo> attachedResourcesById = new HashMap<>();
         int attachedResourceCounter = 0;
         final Set<String> restoredOutputClassifiers = new HashSet<>();
 
@@ -334,12 +347,13 @@ public class CacheControllerImpl implements CacheController {
         if (cacheConfig.isRestoreOnDiskArtifacts() && MavenProjectInput.isRestoreOnDiskArtifacts(project)) {
             Path restorationPath = project.getBasedir().toPath().resolve(artifact.getFilePath());
             final AtomicBoolean restored = new AtomicBoolean(false);
+            final Path symlinkBoundary = project.getBasedir().toPath();
             return file -> {
                 // Set to restored even if it fails later, we don't want multiple try
                 if (restored.compareAndSet(false, true)) {
                     verifyRestorationInsideProject(project, restorationPath);
                     try {
-                        restoreArtifactToDisk(file, artifact, restorationPath);
+                        restoreArtifactToDisk(file, artifact, restorationPath, symlinkBoundary);
                     } catch (IOException e) {
                         LOGGER.error("Cannot restore file " + artifact.getFileName(), e);
                         throw new RuntimeException(e);
@@ -356,11 +370,12 @@ public class CacheControllerImpl implements CacheController {
      * Restores an artifact from cache to disk, handling both regular files and directory artifacts.
      * Directory artifacts (cached as zips) are unzipped back to their original directory structure.
      */
-    private void restoreArtifactToDisk(File cachedFile, Artifact artifact, Path restorationPath) throws IOException {
+    private void restoreArtifactToDisk(File cachedFile, Artifact artifact, Path restorationPath, Path symlinkBoundary)
+            throws IOException {
         // Check the explicit isDirectory flag set during save.
         // Directory artifacts (e.g., target/classes) are saved as zips and need to be unzipped on restore.
         if (artifact.isIsDirectory()) {
-            restoreDirectoryArtifact(cachedFile, artifact, restorationPath);
+            restoreDirectoryArtifact(cachedFile, artifact, restorationPath, symlinkBoundary);
         } else {
             restoreRegularFileArtifact(cachedFile, artifact, restorationPath);
         }
@@ -369,11 +384,17 @@ public class CacheControllerImpl implements CacheController {
     /**
      * Restores a directory artifact by unzipping the cached zip file.
      */
-    private void restoreDirectoryArtifact(File cachedZip, Artifact artifact, Path restorationPath) throws IOException {
+    private void restoreDirectoryArtifact(File cachedZip, Artifact artifact, Path restorationPath, Path symlinkBoundary)
+            throws IOException {
         if (!Files.exists(restorationPath)) {
             Files.createDirectories(restorationPath);
         }
-        CacheUtils.unzip(cachedZip.toPath(), restorationPath, cacheConfig.isPreservePermissions());
+        CacheUtils.unzip(
+                cachedZip.toPath(),
+                restorationPath,
+                cacheConfig.isPreservePermissions(),
+                artifact.isPreserveSymlinks(),
+                symlinkBoundary);
         LOGGER.debug("Restored directory artifact by unzipping: {} -> {}", artifact.getFileName(), restorationPath);
     }
 
@@ -553,7 +574,7 @@ public class CacheControllerImpl implements CacheController {
         final MavenSession session = context.getSession();
         final ProjectCacheState state = getProjectState(project);
         try {
-            state.attachedResourcesPathsById.clear();
+            state.attachedResourcesById.clear();
             state.attachedResourceCounter = 0;
 
             // Get build start time to filter out stale artifacts from previous builds
@@ -664,7 +685,7 @@ public class CacheControllerImpl implements CacheController {
         } finally {
             // Cleanup project state to free memory, but preserve stagingDirectory for restore
             // Note: stagingDirectory must persist until restoreStagedArtifacts() is called
-            state.attachedResourcesPathsById.clear();
+            state.attachedResourcesById.clear();
             state.attachedResourceCounter = 0;
             state.restoredOutputClassifiers.clear();
             // stagingDirectory is NOT cleared here - it's cleared in restoreStagedArtifacts()
@@ -806,8 +827,12 @@ public class CacheControllerImpl implements CacheController {
 
             // Always set filePath (needed for artifact restoration)
             // Get the relative path of any extra zip directory added to the cache
-            Path relativePath = state.attachedResourcesPathsById.get(projectArtifact.getClassifier());
-            if (relativePath == null) {
+            AttachedResourceInfo resourceInfo = state.attachedResourcesById.get(projectArtifact.getClassifier());
+            Path relativePath;
+            if (resourceInfo != null) {
+                relativePath = resourceInfo.relativePath;
+                dto.setPreserveSymlinks(resourceInfo.preserveSymlinks);
+            } else {
                 // If the path was not a member of this map, we are in presence of an original artifact.
                 // we get its location on the disk
                 relativePath = project.getBasedir().toPath().relativize(file.toAbsolutePath());
@@ -1039,9 +1064,18 @@ public class CacheControllerImpl implements CacheController {
 
     private boolean zipAndAttachArtifact(MavenProject project, Path dir, String classifier, final String glob)
             throws IOException {
+        return zipAndAttachArtifact(project, dir, classifier, glob, false);
+    }
+
+    private boolean zipAndAttachArtifact(
+            MavenProject project, Path dir, String classifier, final String glob, boolean preserveSymlinks)
+            throws IOException {
         Path temp = Files.createTempFile("maven-incremental-", project.getArtifactId());
         temp.toFile().deleteOnExit();
-        boolean hasFile = CacheUtils.zip(dir, temp, glob, cacheConfig.isPreservePermissions());
+        // Use project basedir as the boundary for symlink validation
+        Path symlinkBoundary = project.getBasedir().toPath();
+        boolean hasFile =
+                CacheUtils.zip(dir, temp, glob, cacheConfig.isPreservePermissions(), preserveSymlinks, symlinkBoundary);
         if (hasFile) {
             projectHelper.attachArtifact(project, "zip", classifier, temp.toFile());
         }
@@ -1056,7 +1090,12 @@ public class CacheControllerImpl implements CacheController {
         if (!Files.exists(outputDir)) {
             Files.createDirectories(outputDir);
         }
-        CacheUtils.unzip(artifactFilePath, outputDir, cacheConfig.isPreservePermissions());
+        CacheUtils.unzip(
+                artifactFilePath,
+                outputDir,
+                cacheConfig.isPreservePermissions(),
+                artifact.isPreserveSymlinks(),
+                baseDir);
     }
 
     // TODO: move to config
@@ -1117,7 +1156,14 @@ public class CacheControllerImpl implements CacheController {
             final Path outputDir = targetDir.resolve(dir.getValue());
             if (isPathInsideProject(project, outputDir)) {
                 attachDirIfNotEmpty(
-                        outputDir, targetDir, project, state, OutputType.EXTRA_OUTPUT, dir.getGlob(), buildStartTime);
+                        outputDir,
+                        targetDir,
+                        project,
+                        state,
+                        OutputType.EXTRA_OUTPUT,
+                        dir.getGlob(),
+                        dir.isPreserveSymlinks(),
+                        buildStartTime);
             } else {
                 LOGGER.warn("Outside project output candidate directory discarded ({})", outputDir.normalize());
             }
@@ -1133,6 +1179,20 @@ public class CacheControllerImpl implements CacheController {
             final String glob,
             final long buildStartTime)
             throws IOException {
+        attachDirIfNotEmpty(
+                candidateSubDir, parentDir, project, state, attachedOutputType, glob, false, buildStartTime);
+    }
+
+    private void attachDirIfNotEmpty(
+            Path candidateSubDir,
+            Path parentDir,
+            MavenProject project,
+            ProjectCacheState state,
+            final OutputType attachedOutputType,
+            final String glob,
+            boolean preserveSymlinks,
+            final long buildStartTime)
+            throws IOException {
         if (Files.isDirectory(candidateSubDir) && hasFiles(candidateSubDir)) {
             final Path relativePath = project.getBasedir().toPath().relativize(candidateSubDir);
             state.attachedResourceCounter++;
@@ -1144,9 +1204,9 @@ public class CacheControllerImpl implements CacheController {
             // 2. Files restored from cache during this session
             // Both cases are valid and should be cached.
 
-            boolean success = zipAndAttachArtifact(project, candidateSubDir, classifier, glob);
+            boolean success = zipAndAttachArtifact(project, candidateSubDir, classifier, glob, preserveSymlinks);
             if (success) {
-                state.attachedResourcesPathsById.put(classifier, relativePath);
+                state.attachedResourcesById.put(classifier, new AttachedResourceInfo(relativePath, preserveSymlinks));
                 LOGGER.debug("Attached directory: {}", candidateSubDir);
             }
         }
